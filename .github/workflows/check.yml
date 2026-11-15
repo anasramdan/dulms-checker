@@ -1,0 +1,62 @@
+name: DULMS Checker
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"      # كل 5 دقايق
+  workflow_dispatch:
+    inputs:
+      force_send:
+        description: "ابعت حتى لو مفيش جديد (للتجربة)"
+        default: "false"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dulms-checker
+  cancel-in-progress: false    # لو الفحص اللي قبله لسه شغال، استنى ومتشغلش اتنين مع بعض
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python packages
+        run: pip install -r requirements.txt
+
+      - name: Cache Chromium
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Install Chromium and Arabic fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fonts-noto-core
+          playwright install --with-deps chromium
+
+      - name: Run bot
+        env:
+          DULMS_USER: ${{ secrets.DULMS_USER }}
+          DULMS_PASS: ${{ secrets.DULMS_PASS }}
+          GREEN_INSTANCE_ID: ${{ secrets.GREEN_INSTANCE_ID }}
+          GREEN_API_TOKEN: ${{ secrets.GREEN_API_TOKEN }}
+          WHATSAPP_NUMBER: ${{ secrets.WHATSAPP_NUMBER }}
+          FORCE_SEND: ${{ github.event.inputs.force_send || 'false' }}
+        run: python bot.py
+
+      - name: Save state
+        if: always()
+        run: |
+          git config user.name "dulms-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add state.json || true
+          git diff --staged --quiet || (git commit -m "update state" && git push)
