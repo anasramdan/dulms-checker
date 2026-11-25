@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import time
 import html
@@ -34,59 +35,88 @@ def need(name):
 
 DULMS_USER = need("DULMS_USER")
 DULMS_PASS = need("DULMS_PASS")
-GREEN_ID = need("GREEN_INSTANCE_ID")
-GREEN_TOKEN = need("GREEN_API_TOKEN")
-_raw_number = need("WHATSAPP_NUMBER")
+TELEGRAM_TOKEN = need("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = need("TELEGRAM_CHAT_ID")
 
-# تنظيف الرقم: لو كتبته 010... بيتحول لـ 2010... تلقائياً
-WHATSAPP_NUMBER = "".join(ch for ch in _raw_number if ch.isdigit())
-if WHATSAPP_NUMBER.startswith("0"):
-    WHATSAPP_NUMBER = "20" + WHATSAPP_NUMBER[1:]
-
-CHAT_ID = f"{WHATSAPP_NUMBER}@c.us"
-API_URL = os.environ.get("GREEN_API_URL", "").strip() or f"https://{GREEN_ID[:4]}.api.greenapi.com"
-MEDIA_URL = os.environ.get("GREEN_MEDIA_URL", "").strip() or API_URL
+TG_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+CAIRO = ZoneInfo("Africa/Cairo")
 HEADLESS = os.environ.get("HEADLESS", "true").lower() != "false"
 FORCE_SEND = os.environ.get("FORCE_SEND", "false").lower() == "true"
 
 BASE = "https://dulms.deltauniv.edu.eg"
 STATE_FILE = "state.json"
-FAIL_ALERT_AFTER = 3   # يبعتلك تنبيه خطأ بعد 3 فشلات متتالية بس (علشان ميزعجكش كل 5 دقايق)
+FAIL_ALERT_AFTER = 3        # يبعتلك تنبيه خطأ بعد 3 فشلات متتالية بس
+STATE_VERSION = 2           # نسخة التشفير: اتغيرت لما انتقلنا من واتساب لتليجرام
+PDF_EVERY_DAYS = 7          # تقرير الـ PDF مرة واحدة في الأسبوع
+MAX_ITEM_MSGS = 40          # أقصى عدد رسايل "عنصر جديد" في الفحص الواحد
 
 
 def scrub(text):
     """يشيل الأسرار من أي رسالة قبل ما تتبعت أو تتطبع"""
-    for secret in (GREEN_TOKEN, DULMS_PASS, WHATSAPP_NUMBER, _raw_number):
+    for secret in (TELEGRAM_TOKEN, DULMS_PASS, TELEGRAM_CHAT_ID):
         if secret:
             text = text.replace(secret, "***")
     return text
 
 
-# ================= الواتس اب =================
+def now_cairo():
+    return datetime.now(CAIRO)
+
+
+# ================= تليجرام =================
+def _chunks(message, limit=3800):
+    """تليجرام بيقبل 4096 حرف في الرسالة، فبنقصّر على حدود السطور"""
+    out, cur = [], ""
+    for line in message.split("\n"):
+        if len(cur) + len(line) + 1 > limit:
+            if cur:
+                out.append(cur)
+                cur = ""
+            while len(line) > limit:   # سطر واحد أطول من الحد: اتقصّر بالعافية
+                out.append(line[:limit])
+                line = line[limit:]
+            cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        out.append(cur)
+    return out or [message[:limit]]
+
+
 def send_text(message):
-    url = f"{API_URL}/waInstance{GREEN_ID}/sendMessage/{GREEN_TOKEN}"
-    r = requests.post(url, json={"chatId": CHAT_ID, "message": message}, timeout=60)
-    print(f"[WA] text -> {r.status_code}")
-    return r.ok
+    ok = True
+    for chunk in _chunks(message):
+        r = requests.post(
+            f"{TG_API}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": chunk},
+            timeout=60,
+        )
+        print(f"[TG] text -> {r.status_code}")
+        if not r.ok:
+            print(f"[TG] {scrub(r.text[:200])}")
+        ok = r.ok and ok
+        time.sleep(0.4)   # احترام حدود تليجرام بين الرسايل
+    return ok
 
 
 def send_pdf(path, caption):
-    url = f"{MEDIA_URL}/waInstance{GREEN_ID}/sendFileByUpload/{GREEN_TOKEN}"
     with open(path, "rb") as f:
         r = requests.post(
-            url,
-            data={"chatId": CHAT_ID, "caption": caption},
-            files={"file": (os.path.basename(path), f, "application/pdf")},
+            f"{TG_API}/sendDocument",
+            data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1000]},
+            files={"document": (os.path.basename(path), f, "application/pdf")},
             timeout=180,
         )
-    print(f"[WA] {path} -> {r.status_code}")
+    print(f"[TG] {path} -> {r.status_code}")
+    if not r.ok:
+        print(f"[TG] {scrub(r.text[:200])}")
     return r.ok
 
 
 # ================= حفظ ومقارنة الحالة (مشفّرة) =================
 def _h(s):
     """بصمة مشفّرة: ملف state.json مش بيحتوي درجات حقيقية، حتى لو الـ repo Public"""
-    return hmac.new(GREEN_TOKEN.encode(), s.encode("utf-8"), hashlib.sha256).hexdigest()[:20]
+    return hmac.new(TELEGRAM_TOKEN.encode(), s.encode("utf-8"), hashlib.sha256).hexdigest()[:20]
 
 
 def load_state():
@@ -103,7 +133,8 @@ def save_state(state):
 
 
 def flatten(courses, key_fn, val_fn):
-    out, seen = {}, {}
+    """بيرجع قاموس مفتاح->قيمة للمقارنة، وقاموس مفتاح->الصف الخام علشان نبني منه الرسايل"""
+    out, rows_by_key, seen = {}, {}, {}
     for c in courses:
         for r in c["rows"]:
             k = f"{c['courseName']} | {key_fn(r)}"
@@ -111,7 +142,8 @@ def flatten(courses, key_fn, val_fn):
             if seen[k] > 1:
                 k += f" #{seen[k]}"
             out[k] = val_fn(r)
-    return out
+            rows_by_key[k] = (c["courseName"], r)
+    return out, rows_by_key
 
 
 def diff(old_hashed, new_plain):
@@ -119,10 +151,76 @@ def diff(old_hashed, new_plain):
     for k, v in new_plain.items():
         hk = _h(k)
         if hk not in old_hashed:
-            added.append((k, v))
+            added.append(k)
         elif old_hashed[hk] != _h(v):
-            changed.append((k, v))
+            changed.append(k)
     return added, changed
+
+
+# ================= الوقت المتبقي =================
+# ملحوظة مهمة: البيانات اللي بنسحبها من DULMS فيها خانة نص واحدة بس للموعد
+# (زي "Due: 30/11/2026 11:59 PM" مثلاً). مفيش حقول منفصلة لتاريخ الفتح أو القفل.
+# الكود بيحاول يفهم الخانة دي: لو لقى فيها تاريخ يفهمه بيحسب الوقت المتبقي،
+# ولو مفيش بيبعت الرسالة من غير سطر الوقت خالص (مش بيخترع مواعيد).
+DATE_RE = re.compile(
+    r"(\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})"
+    r"(\s+\d{1,2}:\d{2}(\s*(AM|PM|am|pm))?)?"
+)
+
+DATE_FORMATS = [
+    "%Y-%m-%d %H:%M", "%Y-%m-%d %I:%M %p", "%Y-%m-%d %I:%M%p",
+    "%d/%m/%Y %H:%M", "%d/%m/%Y %I:%M %p", "%d/%m/%Y %I:%M%p",
+    "%m/%d/%Y %I:%M %p", "%m/%d/%Y %H:%M",
+    "%d-%m-%Y %H:%M", "%d-%m-%Y %I:%M %p",
+    "%d %b %Y %I:%M %p", "%d %B %Y %I:%M %p", "%d %b %Y", "%d %B %Y",
+    "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y",
+]
+
+
+def parse_due(text):
+    """بيحاول يطلّع تاريخ من نص الموعد. بيرجع None لو ملقاش تاريخ يفهمه."""
+    if not text:
+        return None
+    m = DATE_RE.search(text)
+    if not m:
+        return None
+    s = re.sub(r"\s+", " ", m.group(0)).strip()
+    for fmt in DATE_FORMATS:
+        try:
+            # الموقع بيشتغل بتوقيت القاهرة (المتصفح متظبط على Africa/Cairo)
+            return datetime.strptime(s, fmt).replace(tzinfo=CAIRO)
+        except ValueError:
+            continue
+    return None
+
+
+def _unit(n, one, two, many):
+    if n == 1:
+        return one
+    if n == 2:
+        return two
+    if 3 <= n <= 10:
+        return f"{n} {many}"
+    return f"{n} {one}"
+
+
+def fmt_remaining(dt, now):
+    """صياغة الوقت المتبقي بالمصري: 'باقي يومين و 3 ساعات' أو 'فات من ساعة'"""
+    secs = int((dt - now).total_seconds())
+    past = secs < 0
+    secs = abs(secs)
+    days, rem = divmod(secs, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    parts = []
+    if days:
+        parts.append(_unit(days, "يوم", "يومين", "أيام"))
+    if hours and len(parts) < 2:
+        parts.append(_unit(hours, "ساعة", "ساعتين", "ساعات"))
+    if not parts:
+        parts.append(_unit(minutes, "دقيقة", "دقيقتين", "دقايق") if minutes else "أقل من دقيقة")
+    text = " و ".join(parts[:2])
+    return f"فات من {text}" if past else f"باقي {text}"
 
 
 # ================= تصميم الـ PDF =================
@@ -171,7 +269,7 @@ def percent_class(text):
 
 
 def build_html(title, courses, headers, class_fns, total_label):
-    now = datetime.now(ZoneInfo("Africa/Cairo")).strftime("%Y-%m-%d  %I:%M %p")
+    now = now_cairo().strftime("%Y-%m-%d  %I:%M %p")
     total_rows = sum(len(c["rows"]) for c in courses)
     body = ""
     for c in courses:
@@ -196,7 +294,7 @@ def build_html(title, courses, headers, class_fns, total_label):
 
 
 def render_pdfs(sections):
-    """بيعمل ملفات الـ PDF للأقسام المطلوبة بس (مش في كل فحص، علشان يوفر وقت)"""
+    """بيعمل ملفات الـ PDF للأقسام المطلوبة بس (التقرير الأسبوعي، مش كل فحص)"""
     out = []
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)   # الـ PDF بيشتغل في headless بس
@@ -219,6 +317,44 @@ def render_pdfs(sections):
         finally:
             browser.close()
     return out
+
+
+# ================= رسايل العناصر الجديدة =================
+def quiz_msg(course, row):
+    """رسالة كويز جديد: الاسم والحالة والموعد، والوقت المتبقي لو التاريخ اتفهم"""
+    lines = [f"🆕 كويز جديد في مادة {course}", f"📝 {row[0]}"]
+    if row[1]:
+        lines.append(f"الحالة: {row[1]}")
+    if row[2]:
+        lines.append(f"الموعد: {row[2]}")
+    dt = parse_due(row[2])
+    if dt:
+        lines.append(f"⏳ {fmt_remaining(dt, now_cairo())}")
+    if row[3] and row[3] != "--":
+        lines.append(f"الدرجة: {row[3]}")
+    return "\n".join(lines)
+
+
+def assignment_msg(course, row):
+    """رسالة واجب جديد: الاسم والحالة والموعد، وفاضل قد إيه يقفل (أو يفتح لو التاريخ لسه جاي)"""
+    lines = [f"🆕 واجب جديد في مادة {course}", f"📚 {row[0]}"]
+    if row[1]:
+        lines.append(f"الحالة: {row[1]}")
+    if row[2]:
+        lines.append(f"الموعد: {row[2]}")
+    dt = parse_due(row[2])
+    if dt:
+        lines.append(f"⏳ {fmt_remaining(dt, now_cairo())} على الموعد")
+    if row[3] and row[3] not in ("--", "Not Graded"):
+        lines.append(f"التقييم: {row[3]}")
+    return "\n".join(lines)
+
+
+def grade_msg(course, row):
+    """رسالة تقييم/درجة جديدة"""
+    lines = [f"🆕 تقييم جديد في مادة {course}", f"📊 {row[0]} - {row[1]}",
+             f"درجتك: {row[2] or '--'} من {row[3] or '--'} ({row[4] or '--'})"]
+    return "\n".join(lines)
 
 
 # ================= السحب من الموقع =================
@@ -291,36 +427,39 @@ def scrape_all():
             open_page(page, "/GradeBook/StudentGradeBook", ".grp-item")
             grades = page.evaluate(GRADES_JS)
             sections["grades"] = dict(
-                courses=grades, title="📊 الدرجات", caption="📊 تقرير الدرجات", pdf="grades_report.pdf",
+                courses=grades, title="📊 الدرجات", caption="📊 تقرير الدرجات الأسبوعي", pdf="grades_report.pdf",
                 html=build_html("📊 تقرير الدرجات", grades,
                                 ["النوع", "الاسم", "درجتك", "الدرجة الكاملة", "النسبة"],
                                 [None, None, None, None, percent_class], "عدد التقييمات"),
                 key_fn=lambda r: f"{r[0]} - {r[1]}",
                 val_fn=lambda r: f"{r[2] or '--'} / {r[3]} ({r[4]})",
+                msg_fn=grade_msg,
             )
 
             # الكويزات
             open_page(page, "/Quizzes/StudentQuizzes", ".course-item")
             quizzes = page.evaluate(items_js(".quiz-item", ".quiz-name", "Quiz", "--", ".quiz-status"))
             sections["quizzes"] = dict(
-                courses=quizzes, title="📝 الكويزات", caption="📝 تقرير الكويزات", pdf="quizzes_report.pdf",
+                courses=quizzes, title="📝 الكويزات", caption="📝 تقرير الكويزات الأسبوعي", pdf="quizzes_report.pdf",
                 html=build_html("📝 تقرير الكويزات", quizzes,
                                 ["الكويز", "الحالة", "الموعد", "الدرجة"],
                                 [None, status_class, None, None], "عدد الكويزات"),
                 key_fn=lambda r: r[0],
                 val_fn=lambda r: f"{r[1] or '--'} | الدرجة: {r[3]}",   # من غير الموعد عمداً
+                msg_fn=quiz_msg,
             )
 
             # الواجبات
             open_page(page, "/Assignment/AssignmentStudentList", ".course-item")
             assigns = page.evaluate(items_js(".assignment-item", ".assign-name", "Assignment", "Not Graded", ".assign-status"))
             sections["assignments"] = dict(
-                courses=assigns, title="📚 الواجبات", caption="📚 تقرير الواجبات", pdf="assignments_report.pdf",
+                courses=assigns, title="📚 الواجبات", caption="📚 تقرير الواجبات الأسبوعي", pdf="assignments_report.pdf",
                 html=build_html("📚 تقرير الواجبات", assigns,
                                 ["الواجب", "الحالة", "الموعد", "التقييم"],
                                 [None, status_class, None, None], "عدد الواجبات"),
                 key_fn=lambda r: r[0],
                 val_fn=lambda r: f"{r[1] or '--'} | التقييم: {r[3]}",
+                msg_fn=assignment_msg,
             )
         finally:
             browser.close()
@@ -328,6 +467,18 @@ def scrape_all():
 
 
 # ================= المنطق الرئيسي =================
+def weekly_pdf_due(state):
+    """التقرير الأسبوعي مستحق لو مبعتوش من 7 أيام (أو خالص)"""
+    last = state.get("_last_pdf")
+    if not last:
+        return True
+    try:
+        last_dt = datetime.fromisoformat(last)
+    except ValueError:
+        return True
+    return (now_cairo() - last_dt).days >= PDF_EVERY_DAYS
+
+
 def run():
     sections = scrape_all()
 
@@ -336,55 +487,79 @@ def run():
 
     state = load_state() or {}
     first_run = not any(name in state for name in sections)
+    # التشفير اتغير مع الانتقال لتليجرام: الحالة القديمة مش هتتعرف،
+    # فبنحدّث الأساس بهدوء من غير ما نغرقك برسايل "جديد" لكل حاجة قديمة
+    migrated = not first_run and state.get("_v") != STATE_VERSION
     prev_fails = state.get("_fails", 0)
     new_state = dict(state)
     new_state["_fails"] = 0
+    new_state["_v"] = STATE_VERSION
 
-    lines, to_send = [], []
+    item_msgs, changed_lines = [], []
     for name, s in sections.items():
         if not s["courses"]:
             print(f"[!] قسم {name} رجع فاضي، هتجاهله ومش هغيّر حالته القديمة")
             continue
-        plain = flatten(s["courses"], s["key_fn"], s["val_fn"])
+        plain, rows_by_key = flatten(s["courses"], s["key_fn"], s["val_fn"])
         added, changed = diff(state.get(name, {}), plain)
         new_state[name] = {_h(k): _h(v) for k, v in plain.items()}
 
-        if first_run or FORCE_SEND or added or changed:
-            to_send.append(s)
-            if not first_run:
-                lines.append(f"\n*{s['title']}*")
-                for k, v in added:
-                    lines.append(f"🆕 {k}\n   {v}")
-                for k, v in changed:
-                    lines.append(f"🔄 {k}\n   بقى: {v}")
+        if first_run or migrated:
+            continue   # أول تشغيل أو ترقية التشفير: نسجّل الأساس بس
+        for k in added:
+            course, row = rows_by_key[k]
+            item_msgs.append(s["msg_fn"](course, row))
+        for k in changed:
+            changed_lines.append(f"🔄 {k}\n   بقى: {plain[k]}")
 
     recovered = prev_fails >= FAIL_ALERT_AFTER
+    pdf_due = weekly_pdf_due(state)
 
-    if not to_send:
+    nothing_new = not item_msgs and not changed_lines
+    if nothing_new and not first_run and not migrated and not FORCE_SEND and not pdf_due:
         print("[=] مفيش جديد، مش هبعت حاجة.")
         if recovered:
             send_text("✅ البوت رجع يشتغل طبيعي بعد ما كان واقف.")
         save_state(new_state)
         return
 
-    if first_run:
-        text = "👋 أهلاً يا أنس! البوت اشتغل لأول مرة، دي كل بياناتك الحالية. من النهاردة هبعتلك بس لما يظهر جديد."
-    else:
-        text = "🔔 فيه تحديثات جديدة في DULMS:\n" + "\n".join(lines[:60])
-        if len(lines) > 60:
-            text += "\n... وغيرها (شوف الملفات)"
-    if recovered:
-        text = "✅ البوت رجع يشتغل بعد ما كان واقف.\n\n" + text
+    ok = True
 
-    pdfs = render_pdfs(to_send)
-    ok = send_text(text)
-    for path, caption in pdfs:
-        ok = send_pdf(path, caption) and ok
+    # 1) رسالة منفصلة لكل عنصر جديد (بالوقت المتبقي لو موجود)
+    if not first_run and not migrated:
+        if recovered:
+            ok = send_text("✅ البوت رجع يشتغل بعد ما كان واقف.") and ok
+        for msg in item_msgs[:MAX_ITEM_MSGS]:
+            ok = send_text(msg) and ok
+        if len(item_msgs) > MAX_ITEM_MSGS:
+            ok = send_text(f"... وفيه {len(item_msgs) - MAX_ITEM_MSGS} حاجة جديدة كمان، شوف التقرير.") and ok
+        if changed_lines:
+            text = "🔔 فيه تحديثات في DULMS:\n\n" + "\n\n".join(changed_lines[:40])
+            ok = send_text(text) and ok
+
+    if first_run:
+        ok = send_text("👋 أهلاً يا أنس! البوت اشتغل على تليجرام لأول مرة، وسجّل بياناتك الحالية كأساس. "
+                       "من النهاردة هبعتلك كل حاجة جديدة في رسالة لوحدها، والتقرير الكامل مرة في الأسبوع.") and ok
+    elif migrated:
+        ok = send_text("🔄 البوت اتحدّث واتنقل من واتساب لتليجرام. سجّل بياناتك الحالية من جديد بهدوء "
+                       "من غير ما يزعجك، ومن دلوقتي التنبيهات هتوصلك هنا.") and ok
+
+    # 2) تقرير الـ PDF: مرة واحدة في الأسبوع بس (وفي أول تشغيل ولما FORCE_SEND=true)
+    if pdf_due or first_run or FORCE_SEND:
+        pdf_sections = [s for s in sections.values() if s["courses"]]
+        pdfs = render_pdfs(pdf_sections)
+        pdf_ok = True
+        for path, caption in pdfs:
+            pdf_ok = send_pdf(path, caption) and pdf_ok
+        if pdf_ok:
+            new_state["_last_pdf"] = now_cairo().isoformat()
+        else:
+            ok = False   # هيعيد محاولة التقرير في الفحص الجاي
 
     if ok:
         save_state(new_state)   # بنحفظ الحالة بس لو الإرسال نجح
     else:
-        raise RuntimeError("فشل إرسال الواتس اب، هيحاول تاني في الفحص الجاي")
+        raise RuntimeError("فشل إرسال تليجرام، هيحاول تاني في الفحص الجاي")
 
 
 def handle_failure(msg):
@@ -408,6 +583,6 @@ if __name__ == "__main__":
             handle_failure(msg)
         except Exception as e2:
             print(f"[-] فشل تسجيل الخطأ: {scrub(str(e2))}")
-        # في التشغيل اليدوي بنظهر الفشل بالأحمر، وفي الأوتوماتيك لأ (علشان GitHub ميبعتش إيميلات كل 5 دقايق)
+        # في التشغيل اليدوي بنظهر الفشل بالأحمر، وفي الأوتوماتيك لأ (علشان GitHub ميبعتش إيميلات كل دقيقة)
         if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
             raise SystemExit(1)
