@@ -49,6 +49,16 @@ FAIL_ALERT_AFTER = 3        # يبعتلك تنبيه خطأ بعد 3 فشلات
 STATE_VERSION = 2           # نسخة التشفير: اتغيرت لما انتقلنا من واتساب لتليجرام
 PDF_EVERY_DAYS = 7          # تقرير الـ PDF مرة واحدة في الأسبوع
 MAX_ITEM_MSGS = 40          # أقصى عدد رسايل "عنصر جديد" في الفحص الواحد
+MAX_REMINDER_MSGS = 20      # أقصى عدد رسايل تذكير مواعيد في الفحص الواحد
+# تنبيهات المواعيد: بتتبعت قبل القفل بـ يوم، وبعدين ساعتين، وبعدين ساعة
+# (لكل كويز وواجب لسه ماعملتوش، وكل تنبيه بيتبعت مرة واحدة بس)
+REMINDER_WINDOWS = [
+    ("d1", 24 * 3600, "يوم"),
+    ("h2", 2 * 3600, "ساعتين"),
+    ("h1", 3600, "ساعة"),
+]
+NAG_INTERVAL = 600          # في آخر ساعة قبل قفل الواجب: زنّ كل 10 دقايق لحد ما يتسلّم
+QUIZ_LAST_CALL = 300        # تنبيه أخير للكويز قبل الموعد بـ 5 دقايق
 
 
 def scrub(text):
@@ -71,10 +81,6 @@ def _chunks(message, limit=3800):
         if len(cur) + len(line) + 1 > limit:
             if cur:
                 out.append(cur)
-                cur = ""
-            while len(line) > limit:   # سطر واحد أطول من الحد: اتقصّر بالعافية
-                out.append(line[:limit])
-                line = line[limit:]
             cur = line
         else:
             cur = f"{cur}\n{line}" if cur else line
@@ -319,6 +325,98 @@ def render_pdfs(sections):
     return out
 
 
+# ================= تذكير المواعيد القريبة =================
+def is_done(status, grade):
+    """بيقرر لو الكويز/الواجب اتعمل فعلاً، علشان التذكير يتبعت بس للي لسه ماعملتوش"""
+    t = (status or "").lower()
+    if any(w in t for w in ["not submitted", "not attempted", "no attempt", "missing", "لم"]):
+        return False
+    if any(w in t for w in ["submitted", "attempted", "finished", "completed", "done", "تم"]):
+        return True
+    g = (grade or "").strip().lower()
+    if g and g not in ("--", "-", "not graded"):
+        return True    # ليه درجة حقيقية يبقى اتعمل خلاص
+    return False       # مفيش دليل إنه اتعمل: نفترض إنه لسه ونفكّرك
+
+
+def reminder_msg(kind, course, row, label, dt, now):
+    """رسالة تذكير بموعد قريب"""
+    icon = "📝" if kind == "كويز" else "📚"
+    word = "موعد" if kind == "كويز" else "قفل"
+    lines = [f"⏰ فاضل {label} على {word} {kind} في مادة {course}", f"{icon} {row[0]}"]
+    if row[2]:
+        lines.append(f"الموعد: {row[2]}")
+    lines.append(f"⏳ {fmt_remaining(dt, now)}")
+    lines.append("⚠️ لسه ماعملتوش، متنساش")
+    return "\n".join(lines)
+
+
+def nag_msg(course, row, dt, now):
+    """رسالة الزن في آخر ساعة قبل قفل الواجب"""
+    lines = [f"🚨 الواجب في مادة {course} لسه ماتسلّمش!", f"📚 {row[0]}"]
+    if row[2]:
+        lines.append(f"الموعد: {row[2]}")
+    lines.append(f"⏳ {fmt_remaining(dt, now)} وهيقفل")
+    lines.append("سلّمه دلوقتي وهبطّل زن 🙏")
+    return "\n".join(lines)
+
+
+def due_reminder(section, key, kind, course, row, reminders_state, now):
+    """بيقرر لو العنصر ده محتاج تذكير دلوقتي، وبيسجّل اللي اتبعت علشان ميتكررش.
+    بيرجع قائمة رسايل (ممكن تكون فاضية)."""
+    dt = parse_due(row[2])
+    if not dt:
+        return []    # التاريخ مش مفهوم: منقدرش نحسب موعد، فمنبعتش تذكير
+    hk = _h(f"{section} | {key}")
+    sent = list(reminders_state.get(hk, []))
+    remaining = (dt - now).total_seconds()
+    if remaining <= 0:
+        # الموعد فات: سجّل إنه خلص علشان منفكّركش فيه تاني
+        if "x" not in sent:
+            reminders_state[hk] = sent + ["x"]
+        return []
+    if is_done(row[1], row[3]):
+        return []
+
+    msgs = []
+    # 1) التنبيهات الأساسية: يوم / ساعتين / ساعة (كل واحدة مرة بس)
+    idx = None
+    for i, (_, window, _) in enumerate(REMINDER_WINDOWS):
+        if remaining <= window:
+            idx = i
+    if idx is not None:
+        marker, _, label = REMINDER_WINDOWS[idx]
+        if marker not in sent:
+            msgs.append(reminder_msg(kind, course, row, label, dt, now))
+            # سجّل كل النوافذ اللي عدّت لحد هنا علشان منبعتش تذكير قديم بعدين
+            sent = sorted(set(sent) | {m for m, _, _ in REMINDER_WINDOWS[: idx + 1]})
+            if kind == "واجب" and marker == "h1":
+                sent.append(f"nag@{int(now.timestamp())}")   # تنبيه الساعة بيحسب كأول زنّة
+
+    # 2) الزن في آخر ساعة للواجب: كل شوية لحد ما يتسلّم فعلاً
+    if kind == "واجب" and remaining <= 3600:
+        last_nag = 0
+        for m in sent:
+            if m.startswith("nag@"):
+                try:
+                    last_nag = max(last_nag, int(m[4:]))
+                except ValueError:
+                    pass
+        if now.timestamp() - last_nag >= NAG_INTERVAL:
+            if not msgs:   # لو لسه باعث تنبيه الساعة في نفس الفحص، متزنّش تاني في نفس اللحظة
+                msgs.append(nag_msg(course, row, dt, now))
+            sent = [m for m in sent if not m.startswith("nag@")]
+            sent.append(f"nag@{int(now.timestamp())}")
+
+    # 3) الكويز: تنبيه أخير قبل الموعد بـ 5 دقايق
+    if kind == "كويز" and remaining <= QUIZ_LAST_CALL and "m5" not in sent:
+        msgs.append(reminder_msg(kind, course, row, "5 دقايق", dt, now))
+        sent.append("m5")
+
+    reminders_state[hk] = sent
+    return msgs
+
+
 # ================= رسايل العناصر الجديدة =================
 def quiz_msg(course, row):
     """رسالة كويز جديد: الاسم والحالة والموعد، والوقت المتبقي لو التاريخ اتفهم"""
@@ -495,7 +593,9 @@ def run():
     new_state["_fails"] = 0
     new_state["_v"] = STATE_VERSION
 
-    item_msgs, changed_lines = [], []
+    item_msgs, changed_lines, reminder_msgs = [], [], []
+    reminders_state = dict(state.get("_reminders", {}))
+    now = now_cairo()
     for name, s in sections.items():
         if not s["courses"]:
             print(f"[!] قسم {name} رجع فاضي، هتجاهله ومش هغيّر حالته القديمة")
@@ -503,6 +603,12 @@ def run():
         plain, rows_by_key = flatten(s["courses"], s["key_fn"], s["val_fn"])
         added, changed = diff(state.get(name, {}), plain)
         new_state[name] = {_h(k): _h(v) for k, v in plain.items()}
+
+        # تذكير المواعيد القريبة للكويزات والواجبات (بيشتغل حتى في أول تشغيل، لأنه مرتبط بالوقت مش بالجديد)
+        if name in ("quizzes", "assignments"):
+            kind = "كويز" if name == "quizzes" else "واجب"
+            for k, (course, row) in rows_by_key.items():
+                reminder_msgs.extend(due_reminder(name, k, kind, course, row, reminders_state, now))
 
         if first_run or migrated:
             continue   # أول تشغيل أو ترقية التشفير: نسجّل الأساس بس
@@ -512,10 +618,11 @@ def run():
         for k in changed:
             changed_lines.append(f"🔄 {k}\n   بقى: {plain[k]}")
 
+    new_state["_reminders"] = reminders_state
     recovered = prev_fails >= FAIL_ALERT_AFTER
     pdf_due = weekly_pdf_due(state)
 
-    nothing_new = not item_msgs and not changed_lines
+    nothing_new = not item_msgs and not changed_lines and not reminder_msgs
     if nothing_new and not first_run and not migrated and not FORCE_SEND and not pdf_due:
         print("[=] مفيش جديد، مش هبعت حاجة.")
         if recovered:
@@ -536,6 +643,12 @@ def run():
         if changed_lines:
             text = "🔔 فيه تحديثات في DULMS:\n\n" + "\n\n".join(changed_lines[:40])
             ok = send_text(text) and ok
+
+    # 1ب) تذكيرات المواعيد: قبل القفل بـ يوم وساعتين وساعة، بس للي لسه ماعملتوش
+    for msg in reminder_msgs[:MAX_REMINDER_MSGS]:
+        ok = send_text(msg) and ok
+    if len(reminder_msgs) > MAX_REMINDER_MSGS:
+        ok = send_text(f"... وفيه {len(reminder_msgs) - MAX_REMINDER_MSGS} موعد قريب كمان، شوف التقرير.") and ok
 
     if first_run:
         ok = send_text("👋 أهلاً يا أنس! البوت اشتغل على تليجرام لأول مرة، وسجّل بياناتك الحالية كأساس. "
