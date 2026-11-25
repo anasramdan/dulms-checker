@@ -6,7 +6,7 @@ import html
 import hmac
 import hashlib
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from playwright.sync_api import sync_playwright
 
@@ -183,10 +183,47 @@ DATE_FORMATS = [
 ]
 
 
-def parse_due(text):
-    """بيحاول يطلّع تاريخ من نص الموعد. بيرجع None لو ملقاش تاريخ يفهمه."""
+REL_RE = re.compile(
+    r"after\s*:?\s*(?:(\d+)\s*days?)?[\s,]*(?:(\d+)\s*hours?)?[\s,]*(?:(\d+)\s*(?:minutes?|mins?))?",
+    re.I,
+)
+LONG_DATE_RE = re.compile(
+    r"([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})(?:\s+at)?\s+(\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)?)"
+)
+
+
+def parse_relative(text):
+    """نص زي 'Will be closed after: 0 days, 23 hours' بيرجع عدد الثواني، أو None"""
     if not text:
         return None
+    m = REL_RE.search(text)
+    if not m or not any(m.groups()):
+        return None
+    d, h, mi = (int(x) if x else 0 for x in m.groups())
+    return d * 86400 + h * 3600 + mi * 60
+
+
+def rel_precision(text):
+    """الموقع بيقرّب لتحت: لو كتب ساعات بس الدقة ساعة، ولو كتب دقايق الدقة دقيقة"""
+    return 60 if re.search(r"min", text or "", re.I) else 3600
+
+
+def parse_due(text, now=None):
+    """بيطلّع تاريخ من نص الموعد: تاريخ كامل، او وقت نسبي (بنحسبه من دلوقتي).
+    بيرجع None لو ملقاش حاجة يفهمها."""
+    if not text:
+        return None
+    m = LONG_DATE_RE.search(text)
+    if m:
+        s = re.sub(r"\s+", " ", f"{m.group(1)[:3]} {m.group(2)} {m.group(3)} {m.group(4)}").strip()
+        for fmt in ("%b %d %Y %I:%M %p", "%b %d %Y %I:%M%p", "%b %d %Y %H:%M"):
+            try:
+                return datetime.strptime(s, fmt).replace(tzinfo=CAIRO)
+            except ValueError:
+                pass
+    rel = parse_relative(text)
+    if rel is not None:
+        return (now or now_cairo()) + timedelta(seconds=rel)
     m = DATE_RE.search(text)
     if not m:
         return None
@@ -198,6 +235,27 @@ def parse_due(text):
         except ValueError:
             continue
     return None
+
+
+def anchored_due(text, reminders_state, hk, now):
+    """للوقت النسبي: بنثبّت الموعد في الـ state وبنضيّق التقدير كل فحص، علشان
+    تنبيهات الساعة و 5 دقايق تفضل دقيقة مع إن الموقع بيكتب ساعات بس."""
+    rel = parse_relative(text)
+    if rel is None:
+        return parse_due(text, now)
+    prec = rel_precision(text)
+    t = now.timestamp()
+    lo, hi = t + rel, t + rel + prec
+    ak = hk + "#a"
+    old = reminders_state.get(ak)
+    if old and len(old) == 2:
+        olo, ohi = float(old[0]), float(old[1])
+        nlo, nhi = max(lo, olo), min(hi, ohi)
+        if nlo <= nhi:
+            lo, hi = nlo, nhi
+        # لو التقديرين مش متوافقين (الموعد اتغيّر) نبدأ من جديد
+    reminders_state[ak] = [lo, hi]
+    return datetime.fromtimestamp(lo, CAIRO)
 
 
 def _unit(n, one, two, many):
@@ -364,10 +422,10 @@ def nag_msg(course, row, dt, now):
 def due_reminder(section, key, kind, course, row, reminders_state, now):
     """بيقرر لو العنصر ده محتاج تذكير دلوقتي، وبيسجّل اللي اتبعت علشان ميتكررش.
     بيرجع قائمة رسايل (ممكن تكون فاضية)."""
-    dt = parse_due(row[2])
+    hk = _h(f"{section} | {key}")
+    dt = anchored_due(row[2], reminders_state, hk, now)
     if not dt:
         return []    # التاريخ مش مفهوم: منقدرش نحسب موعد، فمنبعتش تذكير
-    hk = _h(f"{section} | {key}")
     sent = list(reminders_state.get(hk, []))
     remaining = (dt - now).total_seconds()
     if remaining <= 0:
