@@ -134,8 +134,12 @@ def load_state():
 
 
 def save_state(state):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
+    # كتابة ذرّية: بنكتب في ملف مؤقت وبعدين نبدله، علشان لو الفحص اتقطع في نص الكتابة
+    # (مثلاً انتهى وقته) الملف الأصلي يفضل سليم ومنضربش الأساس
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=1, sort_keys=True)
+    os.replace(tmp, STATE_FILE)
 
 
 def flatten(courses, key_fn, val_fn):
@@ -593,7 +597,7 @@ def scrape_all():
             )
 
             # الكويزات
-            open_page(page, "/Quizzes/StudentQuizzes", ".course-item")
+            open_page(page, "/Quizzes/StudentQuizzes", ".quiz-item")
             quizzes = page.evaluate(items_js(".quiz-item", ".quiz-name", "Quiz", "--", ".quiz-status"))
             sections["quizzes"] = dict(
                 courses=quizzes, title="📝 الكويزات", caption="📝 تقرير الكويزات الأسبوعي", pdf="quizzes_report.pdf",
@@ -606,7 +610,7 @@ def scrape_all():
             )
 
             # الواجبات
-            open_page(page, "/Assignment/AssignmentStudentList", ".course-item")
+            open_page(page, "/Assignment/AssignmentStudentList", ".assignment-item")
             assigns = page.evaluate(items_js(".assignment-item", ".assign-name", "Assignment", "Not Graded", ".assign-status"))
             sections["assignments"] = dict(
                 courses=assigns, title="📚 الواجبات", caption="📚 تقرير الواجبات الأسبوعي", pdf="assignments_report.pdf",
@@ -655,8 +659,13 @@ def run():
     reminders_state = dict(state.get("_reminders", {}))
     now = now_cairo()
     for name, s in sections.items():
-        if not s["courses"]:
-            print(f"[!] قسم {name} رجع فاضي، هتجاهله ومش هغيّر حالته القديمة")
+        row_count = sum(len(c["rows"]) for c in s["courses"])
+        if not s["courses"] or row_count == 0:
+            # مهم جداً: الموقع أحياناً بيرجّع عناوين المواد من غير الصفوف لما يكون بطيء.
+            # لو حفظنا الحالة ساعتها هتمسح الأساس، وأول ما الصفوف ترجع تاني
+            # كل العناصر القديمة هتتبعت من جديد كأنها جديدة (وده اللي كان بيحصل).
+            # فبنتجاهل القسم الفاضي خالص ومنسيب حالته القديمة زي ما هي.
+            print(f"[!] قسم {name} رجع من غير صفوف (الموقع بطيء غالباً)، هتجاهله ومش هغيّر حالته القديمة")
             continue
         plain, rows_by_key = flatten(s["courses"], s["key_fn"], s["val_fn"])
         added, changed = diff(state.get(name, {}), plain)
@@ -757,3 +766,4 @@ if __name__ == "__main__":
         # في التشغيل اليدوي بنظهر الفشل بالأحمر، وفي الأوتوماتيك لأ (علشان GitHub ميبعتش إيميلات كل دقيقة)
         if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
             raise SystemExit(1)
+
